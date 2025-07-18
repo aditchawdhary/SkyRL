@@ -6,6 +6,7 @@ import tempfile
 from typing import Optional, Dict, Any, List
 
 from openai import OpenAI
+from security import safe_command
 
 
 @dataclass
@@ -95,8 +96,7 @@ class GuixExecutor(Executor):
         )
 
         try:
-            result = subprocess.run(
-                guix_cmd,
+            result = safe_command.run(subprocess.run, guix_cmd,
                 shell=False,
                 capture_output=True,
                 text=True,

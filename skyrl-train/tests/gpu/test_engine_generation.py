@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 from omegaconf import DictConfig
 from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.utils import initialize_ray
+from security import safe_command
 
 model = "Qwen/Qwen2.5-1.5B-Instruct"
 tp_size = 2
@@ -68,7 +69,7 @@ def init_remote_vinference_engines(tp_size):
     env["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
 
     # Start the vLLM server process
-    vllm_process = subprocess.Popen(vllm_cmd, env=env)
+    vllm_process = safe_command.run(subprocess.Popen, vllm_cmd, env=env)
 
     wait_for_server(url=f"localhost:{engine_port}", health_path="health")
     print(f"Server at localhost:{engine_port} is online")

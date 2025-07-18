@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
 import psutil
+from security import safe_command
 
 
 def get_free_port():
@@ -117,7 +118,7 @@ class VLLMServer:
             stderr = sys.stderr
 
         # Start the server process
-        process = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+        process = safe_command.run(subprocess.Popen, cmd, stdout=stdout, stderr=stderr)
         self.pid = process.pid
         return process.pid, f"{self.host}:{self.port}", str(stdout_log), str(stderr_log)
 
