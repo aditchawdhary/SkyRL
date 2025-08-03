@@ -38,6 +38,7 @@ dependencies = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
+    "security==1.3.1",
 ]
 
 [tool.uv]

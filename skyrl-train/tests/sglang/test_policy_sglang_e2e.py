@@ -19,6 +19,7 @@ from skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from skyrl_train.inference_engines.base import InferenceEngineInput
 from skyrl_train.utils import get_ray_pg_ready_with_timeout, initialize_ray
 from skyrl_train.entrypoints.main_base import config_dir
+from security import safe_requests
 
 model = "Qwen/Qwen2.5-1.5B-Instruct"
 tp_size = 2
@@ -110,7 +111,7 @@ def init_sglang_engines(use_local, tp_size, colocate_all, sampling_params):
         start_time = time.time()
         while True:
             try:
-                response = requests.get(f"http://{url}/health_generate")
+                response = safe_requests.get(f"http://{url}/health_generate")
                 if response.ok:
                     return
             except requests.exceptions.ConnectionError:
