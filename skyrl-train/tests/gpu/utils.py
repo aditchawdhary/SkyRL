@@ -19,6 +19,7 @@ from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.utils import get_ray_pg_ready_with_timeout
 from skyrl_train.distributed.dispatch import concatenate_outputs_after_mesh_dispatch
 from skyrl_train.generators.base import GeneratorInput, ConversationType
+from security import safe_requests
 
 TEST_DATA_PATH = os.path.expanduser("~/data/gsm8k/validation.parquet")
 
@@ -196,7 +197,7 @@ def wait_for_server(url: str, health_path: str, timeout: int = 60, interval: flo
     start_time = time.time()
     while True:
         try:
-            response = requests.get(f"http://{url}/{health_path}")
+            response = safe_requests.get(f"http://{url}/{health_path}")
             if response.ok:
                 return
         except requests.exceptions.ConnectionError:
