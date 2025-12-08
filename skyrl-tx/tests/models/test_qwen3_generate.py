@@ -18,6 +18,9 @@ from tx.utils.models import load_safetensors
 
 def test_qwen3_generate():
     """Test batched text generation with KV caching matches HuggingFace."""
+    import jax.profiler  # Add this import
+    jax.profiler.start_trace("/tmp/jax-trace")
+
     model_name = "Qwen/Qwen3-0.6B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left")
     hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
@@ -59,6 +62,7 @@ def test_qwen3_generate():
             batch.attention_mask.numpy(),
             sampling_params=sampling_params,
         )
+        jax.profiler.stop_trace()
 
         # Compare generated tokens
         for i, (our_tokens, hf_tokens, sampling_param) in enumerate(

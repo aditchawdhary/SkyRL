@@ -106,37 +106,71 @@ class GeneratorMixin:
     ):
         """JIT-compiled prefill + decode loop. Fuses everything for maximum efficiency."""
         # Compute positions from attention mask
+        #Debug: Input shapes
+        jax.debug.print("=== PREFILL START ===")
+        #jax.debug.print("input_ids shape: {}, attention_mask shape: {}", input_ids.shape, attention_mask.shape)
+        #jax.debug.print("max_length: {}, max_new_tokens: {}", max_length, max_new_tokens)
+        jax.debug.print("="*80)
+        jax.debug.print("INPUT PARAMETERS:")
+        jax.debug.print("="*80)
+        jax.debug.print("model: {}", type(model).__name__)
+        jax.debug.print("input_ids: shape={}, dtype={}, first_row={}", input_ids.shape, input_ids.dtype, input_ids[0])
+        jax.debug.print("attention_mask: shape={}, dtype={}, first_row={}", attention_mask.shape, attention_mask.dtype, attention_mask[0])
+        jax.debug.print("max_length: {}", max_length)
+        jax.debug.print("max_new_tokens: {}", max_new_tokens)
+        jax.debug.print("adapter_indices: {}", adapter_indices)
+        jax.debug.print("temperatures: shape={}, values={}", temperatures.shape, temperatures)
+        jax.debug.print("rngs: shape={}, first_rng={}", rngs.shape, rngs[0])
+        jax.debug.print("stop_tokens: shape={}, values={}", stop_tokens.shape, stop_tokens)
+        jax.debug.print("prompt_logprobs: {}", prompt_logprobs)
+        jax.debug.print("="*80)
+
         positions = compute_positions(attention_mask)
+        jax.debug.print("positions shape: {}, first row: {}", positions.shape, positions[0, :10])
 
         # Prefill: process full prompt
         outputs = model(input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+        jax.debug.print("prefill logits shape: {}", outputs.logits.shape)
+        jax.debug.print("kv_cache.keys[0] shape: {}", outputs.kv_cache.keys[0].shape)
 
         # Compute prompt logprobs if requested
         prompt_logprobs_array = compute_prompt_logprobs(outputs.logits, input_ids) if prompt_logprobs else None
+        if prompt_logprobs_array:
+            jax.debug.print("prompt_logprobs shape: {}", prompt_logprobs_array.shape)
 
         # Pad KV cache and attention mask
         kv_cache = outputs.kv_cache.pad_to_length(max_length)
         decode_attention_mask = jnp.pad(attention_mask, ((0, 0), (0, max_length - attention_mask.shape[1])))
+        jax.debug.print("padded kv_cache.keys[0] shape: {}", kv_cache.keys[0].shape)
 
         def decode_fn(s: DecodeState, step: jax.Array) -> tuple[DecodeState, tuple[jax.Array, jax.Array]]:
             """Decode one token step. Returns (state, (token, logprob)) for scan accumulation."""
+            jax.debug.print("--- Decode step: {} ---", step)
+
             # Sample next token
             split_keys = jax.vmap(jax.random.split)(s.rngs)
             rngs, sample_keys = split_keys[:, 0], split_keys[:, 1]
 
             zero_temp_mask = temperatures == 0.0
             scaled_logits = s.logits / jnp.where(zero_temp_mask, 1.0, temperatures)[:, None]
+            jax.debug.print("logits shape: {}, scaled_logits shape: {}", s.logits.shape, scaled_logits.shape)
+
             sampled = jax.vmap(lambda key, logit: jax.random.categorical(key, logit, axis=-1))(
                 sample_keys, scaled_logits
             )
             greedy = jnp.argmax(s.logits, axis=-1)
             next_token = jnp.where(zero_temp_mask[:, None], greedy[:, None], sampled[:, None])
+            jax.debug.print("sampled token: {}, greedy token: {}", sampled[0], greedy[0])
+            jax.debug.print("next_token: {}", next_token[0])
+
             log_probs = jax.nn.log_softmax(s.logits, axis=-1)
             sampled_logprob = jnp.take_along_axis(log_probs, next_token, axis=-1)
+            jax.debug.print("sampled_logprob: {}", sampled_logprob[0])
 
             # Track first stop token position (-1 means not stopped yet)
             is_stop = jnp.any(next_token == stop_tokens, axis=1)
             stop_pos = jnp.where((s.stop_pos == -1) & is_stop, step + 1, s.stop_pos)
+            jax.debug.print("is_stop: {}, stop_pos: {}", is_stop[0], stop_pos[0])
 
             # Update attention mask: set next position to 1
             next_attention_mask = s.attention_mask.at[:, s.kv_cache.cache_position].set(1)
@@ -148,6 +182,8 @@ class GeneratorMixin:
                 kv_cache=s.kv_cache,
                 adapter_indices=adapter_indices,
             )
+            jax.debug.print("decode output logits shape: {}", outputs.logits.shape)
+
             next_state = DecodeState(
                 kv_cache=outputs.kv_cache,
                 rngs=rngs,
@@ -166,6 +202,9 @@ class GeneratorMixin:
             logits=outputs.logits[:, -1, :],
             stop_pos=jnp.full((input_ids.shape[0],), -1),
         )
+        jax.debug.print("=== DECODE START ===")
+        jax.debug.print("initial logits shape: {}", initial_state.logits.shape)
+
 
         final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(
             decode_fn, initial_state, xs=jnp.arange(max_new_tokens)
@@ -174,6 +213,8 @@ class GeneratorMixin:
         # Post-process: transpose scan outputs from [Steps, Batch, 1] to [Batch, Steps]
         new_tokens = jnp.swapaxes(tokens_stacked, 0, 1).squeeze(-1)
         new_logprobs = jnp.swapaxes(logprobs_stacked, 0, 1).squeeze(-1)
+        jax.debug.print("=== DECODE COMPLETE ===")
+        jax.debug.print("new_tokens shape: {}, new_logprobs shape: {}", new_tokens.shape, new_logprobs.shape)
 
         return new_tokens, new_logprobs, final_state.stop_pos, prompt_logprobs_array
 
