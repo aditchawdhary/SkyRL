@@ -552,6 +552,11 @@ def _safe_exp_delta(delta: torch.Tensor, clip: float = 20.0, out_dtype=None) -> 
     return y.to(out_dtype or delta.dtype)
 
 
+def _is_fused_kernel_available() -> bool:
+    """Check if CUDA is available for fused kernels (uses torch.compile, no Triton needed)."""
+    return torch.cuda.is_available()
+
+
 @register_policy_loss(PolicyLossType.REGULAR)
 @register_policy_loss(PolicyLossType.DUAL_CLIP)
 def ppo_policy_loss(
@@ -570,6 +575,42 @@ def ppo_policy_loss(
         "seq_mean_token_sum_norm",
     ], "loss_reduction must be either 'token_mean', 'sequence_mean', or 'seq_mean_token_sum_norm'"
 
+    # Try to use fused kernel if available and enabled
+    use_fused = config.get("use_fused_ppo_loss", True)
+    if use_fused and _is_fused_kernel_available():
+        try:
+            from skyrl_train.kernels.fused_ppo_loss import fused_ppo_loss
+            
+            # Determine parameters
+            use_dual_clip = config.policy_loss_type == "dual_clip"
+            clip_ratio_c = config.get("clip_ratio_c", 3.0) if use_dual_clip else 3.0
+            use_tis = config.get("use_tis", False)
+            tis_imp_ratio_cap = config.get("tis_imp_ratio_cap", 10.0) if use_tis else 10.0
+            
+            # Call fused kernel
+            per_token_loss, clip_ratio = fused_ppo_loss(
+                log_probs=log_probs,
+                old_log_probs=old_log_probs,
+                advantages=advantages,
+                loss_mask=loss_mask,
+                eps_clip_low=config.eps_clip_low,
+                eps_clip_high=config.eps_clip_high,
+                use_dual_clip=use_dual_clip,
+                clip_ratio_c=clip_ratio_c,
+                use_tis=use_tis,
+                rollout_logprobs=rollout_logprobs,
+                tis_imp_ratio_cap=tis_imp_ratio_cap,
+            )
+            
+            # Reduce loss according to config
+            loss = reduce_loss(per_token_loss, loss_mask, loss_reduction, config.max_seq_len)
+            return loss, clip_ratio
+        except Exception as e:
+            # Fall back to reference implementation if fused kernel fails
+            from loguru import logger as logger_
+            logger_.warning(f"Fused PPO loss kernel failed, falling back to reference: {e}")
+    
+    # Reference implementation
     ratio = _safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
     surr1 = ratio * advantages
     surr2 = ratio.clamp(1 - config.eps_clip_low, 1 + config.eps_clip_high) * advantages
