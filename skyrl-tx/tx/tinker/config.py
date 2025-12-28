@@ -7,6 +7,7 @@ from pathlib import Path
 from cloudpathlib import AnyPath
 from pydantic import BaseModel, Field
 
+from tx.mem_cache.memory_pool import MHATokenToKVPool
 
 class EngineConfig(BaseModel):
     """Configuration for the Tinker engine."""
@@ -56,6 +57,23 @@ class EngineConfig(BaseModel):
     external_inference_lora_base: Path = Field(
         default=Path("/tmp/lora_models"),
         description="Directory where LoRA models will be extracted for external inference engines",
+    )
+    #KV cache optimizations
+    use_optimized_kv_cache: bool = Field(
+      default=True,
+      description="Use SGLang JAX optimized KV cache for faster inference"
+    )
+    kv_cache_page_size: int = Field(
+      default=16,
+      description="Page size for paged KV cache (tune based on sequence lengths)"
+    )
+    kv_cache_dtype: str = Field(
+      default="bfloat16",
+      description="Data type for KV cache default to bf16"
+    )
+    enable_prefix_cache: bool = Field(
+      default=False,
+      description="Enable prefix cache to reuse KV cache for repeated prompts"
     )
 
 

@@ -12,6 +12,38 @@ from tx.models.types import CausalLMOutput, ModelOutput
 from tx.utils.generator import GeneratorMixin, KVCache, compute_positions
 
 
+def extract_batch_cache_from_pool(
+    pool_buffer: jax.Array,
+    cache_locations: jax.Array,
+    max_length: int,
+    batch_size: int,
+) -> jax.Array:
+    """Extract per-sequence cache slices from the pool.
+    
+    Args:
+        pool_buffer: Full pool buffer [pool_size, num_heads, head_dim]
+        cache_locations: Starting position for each sequence [batch_size]
+        max_length: Maximum sequence length
+        batch_size: Number of sequences
+        
+    Returns:
+        Batch cache [batch_size, max_length, num_heads, head_dim]
+    """
+    # For each sequence, extract its slice from the pool
+    # seq_i cache is at pool[cache_locations[i] : cache_locations[i] + max_length]
+    
+    def extract_sequence(loc):
+        # Extract one sequence's cache
+        return jax.lax.dynamic_slice(
+            pool_buffer,
+            (loc, 0, 0), # Start at (loc, 0, 0)
+            (max_length, pool_buffer.shape[1], pool_buffer.shape[2])
+        )
+    
+    # Extract all sequences
+    batch_cache = jax.vmap(extract_sequence)(cache_locations)
+    return batch_cache
+
 class Qwen3Attention(nnx.Module):
     """Multi-head attention with Grouped Query Attention (GQA) support."""
 
@@ -331,6 +363,9 @@ class Qwen3Model(nnx.Module):
         output_hidden_states: bool | None = None,
         adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
+        kv_cache_pool=None,
+        cache_locations: jax.Array | None = None,
+        max_cache_length: int | None = None,
     ) -> ModelOutput:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -343,16 +378,67 @@ class Qwen3Model(nnx.Module):
         for layer_idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
+                
+            if kv_cache_pool is not None and cache_locations is not None:
+                # Use optimized pool
+                # Get the full pool buffers
+                k_pool_buffer, v_pool_buffer = kv_cache_pool.get_kv_buffer(layer_idx)
+                
+                # Extract this batch's cache slices from the pool
+                batch_size, seq_len = input_ids.shape
+                
+                # Use passed max_cache_length instead of inferring
+                if max_cache_length is None:
+                  max_cache_length = k_pool_buffer.shape[0] // batch_size
+                  
+                # Extract per-sequence caches from pool
+                k_cache = extract_batch_cache_from_pool(k_pool_buffer, cache_locations, max_cache_length, batch_size)
+                v_cache = extract_batch_cache_from_pool(v_pool_buffer, cache_locations, max_cache_length, batch_size)
+                cache_position = kv_cache.cache_position if kv_cache else 0
 
-            hidden_states, (k, v) = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                positions=positions,
-                adapter_indices=adapter_indices,
-                kv_cache=kv_cache and (kv_cache.keys[layer_idx], kv_cache.values[layer_idx], kv_cache.cache_position),
-            )
-            updated_keys.append(k)
-            updated_values.append(v)
+                hidden_states, (k, v) = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    positions=positions,
+                    adapter_indices=adapter_indices,
+                    kv_cache=(k_cache, v_cache, cache_position),
+                )
+
+                # Update pool with new K, V
+                _, seq_len, num_heads, head_dim = k.shape
+
+                # Compute cache locations for each token
+                # Create location array for all tokens in the batch
+                seq_offsets = jnp.arange(seq_len)[None, :] # [1, seq_len]
+                loc_2d = cache_locations[:, None] + cache_position + seq_offsets # [batch, seq_len]
+                loc = loc_2d.reshape(-1) # Flatten to [batch * seq_len]
+
+                # Reshape K, V to [batch * seq_len, num_heads, head_dim]
+                k_flat = k.reshape(-1, num_heads, head_dim)
+                v_flat = v.reshape(-1, num_heads, head_dim)
+                
+                # Update the pool
+                kv_cache_pool.set_kv_buffer(
+                    layer_id=layer_idx,
+                    loc=loc,
+                    k=k_flat,
+                    v=v_flat,
+                    is_decode=(seq_len == 1),
+                )
+                
+                updated_keys.append(k)
+                updated_values.append(v)
+            else:
+                # Standard path (backward compatible)
+                hidden_states, (k, v) = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    positions=positions,
+                    adapter_indices=adapter_indices,
+                    kv_cache=kv_cache and (kv_cache.keys[layer_idx], kv_cache.values[layer_idx], kv_cache.cache_position),
+                )
+                updated_keys.append(k)
+                updated_values.append(v)
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
@@ -400,6 +486,9 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
         output_hidden_states: bool | None = None,
         adapter_indices: jax.Array | None = None,
         kv_cache: KVCache | None = None,
+        kv_cache_pool=None,
+        cache_locations: jax.Array | None = None,
+        max_cache_length: int | None = None,
     ) -> CausalLMOutput:
         if positions is None:
             positions = compute_positions(attention_mask)
@@ -411,6 +500,9 @@ class Qwen3ForCausalLM(nnx.Module, GeneratorMixin):
             output_hidden_states=output_hidden_states,
             adapter_indices=adapter_indices,
             kv_cache=kv_cache,
+            kv_cache_pool=kv_cache_pool,
+            cache_locations=cache_locations,
+            max_cache_length=max_cache_length,
         )
         hidden_states = outputs.last_hidden_state
         if self.config.tie_word_embeddings:

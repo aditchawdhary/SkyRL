@@ -39,7 +39,7 @@ from tx.utils.models import (
 )
 from tx.layers.lora import update_adapter_config
 from tx.utils.log import logger
-
+from tx.mem_cache.memory_pool import MHATokenToKVPool
 
 @contextmanager
 def log_timing(request: str):
@@ -182,6 +182,16 @@ class TinkerEngine:
             f"Initialized base model {self.config.base_model} with max_lora_adapters={self.config.max_lora_adapters}, max_lora_rank={self.config.max_lora_rank}"
         )
 
+        self.kv_cache_pool = None
+        if self.config.use_optimized_kv_cache:
+          self.kv_cache_pool = self._create_kv_cache_pool()
+          logger.info(
+            f"Initialized optimized KV cache pool: "
+            f"{self.kv_cache_pool.mem_usage:.2f} GB, "
+            f"page_size={self.config.kv_cache_page_size},"
+            f"dtype={self.config.kv_cache_dtype}"
+          )          
+
         self._create_loss_and_grad_fn()
 
     def _extract_checkpoint_data(self, model_id: str) -> dict:
@@ -222,6 +232,42 @@ class TinkerEngine:
                 checkpoint_db.completed_at = datetime.now(timezone.utc)
                 session.add(checkpoint_db)
                 session.commit()
+    
+    def _create_kv_cache_pool(self) -> MHATokenToKVPool:
+      """Create optimized KV cache pool using SGLang JAX.
+      
+      Returns:
+          MHATokenToKVPool instance for efficient KV cache management
+      """
+      # Map string dtype to JAX dtype
+      dtype_map = {
+        "float32": jnp.float32,
+        "float16": jnp.float16,
+        "bfloat16": jnp.bfloat16,
+      }
+      kv_dtype = dtype_map.get(self.config.kv_cache_dtype, jnp.bfloat16)
+      
+      # Calculate cache size based on max sequences and sequence length
+      max_sequences = self.config.sample_max_num_sequences or 32
+      max_seq_len = self.model_config.max_position_embeddings
+      cache_size = max_sequences * max_seq_len
+      
+      logger.info(
+        f"Creating KV cache pool: "
+        f"size={cache_size} tokens ({max_sequences} seqs * {max_seq_len} tokens), "
+        f"num_layers={self.model_config.num_hidden_layers}, "
+        f"num_kv_heads={self.model_config.num_key_value_heads}"
+      )
+      
+      return MHATokenToKVPool(
+          size=cache_size,
+          page_size=self.config.kv_cache_page_size,
+          dtype=kv_dtype,
+          head_num=self.model_config.num_key_value_heads,
+          head_dim=self.model_config.hidden_size // self.model_config.num_attention_heads,
+          layer_num=self.model_config.num_hidden_layers,
+          mesh=self.mesh
+      )
 
     def _create_loss_and_grad_fn(self):
         """Compile and cache the loss function to avoid re-jitting on every call."""
@@ -844,6 +890,10 @@ class TinkerEngine:
                 )
 
                 with self._jit_timing_context(max_len, mode="sample"):
+                    kv_cache_pool = self.kv_cache_pool if self.config.use_optimized_kv_cache else None
+                    if kv_cache_pool is not None:
+                        logger.debug(f"Using optimized KV cache pool for batch_size={input_ids.shape[0]}")
+                    
                     result = model.generate(
                         input_ids,
                         attention_mask,
@@ -851,6 +901,7 @@ class TinkerEngine:
                         adapter_indices=adapter_indices,
                         prompt_logprobs=needs_prompt_logprobs,
                         tokenizer=self.tokenizer,
+                        kv_cache_pool=kv_cache_pool,
                     )
                 # Only take the actual results, not the padded ones
                 batch_size = batch_end - batch_start

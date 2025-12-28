@@ -50,6 +50,7 @@ class DecodeState:
     last_positions: jax.Array
     logits: jax.Array
     stop_pos: jax.Array  # Position where stop token was found
+    cache_locations: jax.Array | None = None
 
 
 @dataclass
@@ -139,13 +140,31 @@ class GeneratorMixin:
         rngs: jax.Array,
         stop_tokens: jax.Array,
         prompt_logprobs: bool = False,
+        kv_cache_pool=None,
     ):
         """JIT-compiled prefill + decode loop. Fuses everything for maximum efficiency."""
         # Compute positions from attention mask
         positions = compute_positions(attention_mask)
 
+        #Initialize cache locations for pool
+        batch_size = input_ids.shape[0]
+        if kv_cache_pool is not None:
+            # Allocate cache locations: each sequence gets a contiguous block
+            # For simplicity, use sequential allocations: seq_i starts at i * max_length
+            cache_locations = jnp.arange(batch_size) * max_length
+        else:
+            cache_locations = None
+
         # Prefill: process full prompt
-        outputs = model(input_ids, attention_mask=attention_mask, positions=positions, adapter_indices=adapter_indices)
+        outputs = model(
+            input_ids, 
+            attention_mask=attention_mask, 
+            positions=positions, 
+            adapter_indices=adapter_indices, 
+            kv_cache_pool=kv_cache_pool, 
+            cache_locations=cache_locations,
+            max_cache_length=max_length,
+        )
 
         # Compute prompt logprobs if requested
         prompt_logprobs_array = compute_prompt_logprobs(outputs.logits, input_ids) if prompt_logprobs else None
@@ -183,6 +202,9 @@ class GeneratorMixin:
                 positions=s.last_positions + 1,
                 kv_cache=s.kv_cache,
                 adapter_indices=adapter_indices,
+                kv_cache_pool=kv_cache_pool,
+                cache_locations=s.cache_locations,
+                max_cache_length=max_length,
             )
             next_state = DecodeState(
                 kv_cache=outputs.kv_cache,
@@ -191,6 +213,7 @@ class GeneratorMixin:
                 last_positions=s.last_positions + 1,
                 logits=outputs.logits[:, -1, :],
                 stop_pos=stop_pos,
+                cache_locations=s.cache_locations,
             )
             return next_state, (next_token, sampled_logprob)
 
@@ -201,6 +224,7 @@ class GeneratorMixin:
             last_positions=positions[:, -1:],
             logits=outputs.logits[:, -1, :],
             stop_pos=jnp.full((input_ids.shape[0],), -1),
+            cache_locations=cache_locations,
         )
 
         final_state, (tokens_stacked, logprobs_stacked) = jax.lax.scan(
@@ -222,6 +246,7 @@ class GeneratorMixin:
         adapter_indices: jax.Array | None = None,
         prompt_logprobs: bool = False,
         tokenizer=None,
+        kv_cache_pool=None,
     ) -> GenerateOutput:
         """Generate text autoregressively with KV caching.
 
@@ -264,6 +289,7 @@ class GeneratorMixin:
             rngs,
             stop_tokens,
             prompt_logprobs=prompt_logprobs,
+            kv_cache_pool=kv_cache_pool,
         )
 
         max_tokens = jnp.array([sp.max_tokens for sp in sampling_params])
