@@ -250,7 +250,7 @@ class MHATokenToKVPool(KVCache):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.head_num = head_num
         self.head_dim = head_dim
-        self.kv_partition_axis = "tensor"
+        self.kv_partition_axis = "tp"
 
         self._create_buffers()
         self._calculate_memory_usage()

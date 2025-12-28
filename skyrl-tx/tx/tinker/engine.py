@@ -264,7 +264,7 @@ class TinkerEngine:
           page_size=self.config.kv_cache_page_size,
           dtype=kv_dtype,
           head_num=self.model_config.num_key_value_heads,
-          head_dim=self.model_config.hidden_size // self.model_config.num_attention_heads,
+          head_dim=self.model_config.hidden_size // self.model_config.num_key_value_heads,
           layer_num=self.model_config.num_hidden_layers,
           mesh=self.mesh
       )

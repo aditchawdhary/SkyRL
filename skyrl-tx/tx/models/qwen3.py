@@ -135,6 +135,11 @@ class Qwen3Attention(nnx.Module):
 
         updated_cache = (k, v)
 
+        kv_len = k.shape[1]
+        if attention_mask.shape[1] < kv_len:
+            pad_length = kv_len - attention_mask.shape[1]
+            attention_mask = jnp.pad(attention_mask, ((0, 0), (pad_length, 0)), constant_values=0)
+
         # Attention (causal only during prefill, GQA handled natively by dot_product_attention)
         attn_output = jax.nn.dot_product_attention(
             q,
